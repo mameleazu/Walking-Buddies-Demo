@@ -4,14 +4,11 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta
 
-# -----------------------
-# App Metadata
-# -----------------------
 APP_NAME = "Walking Buddies"
 st.set_page_config(page_title=APP_NAME, page_icon="👟", layout="wide")
 
 # -----------------------
-# Simple in-memory store (replace with DB for production)
+# Session State (safe defaults)
 # -----------------------
 if "users" not in st.session_state:
     st.session_state.users = {}  # user_id -> dict
@@ -41,17 +38,18 @@ TIERS = [
 # -----------------------
 # Helpers
 # -----------------------
-def calc_streak(dates: list[datetime]) -> int:
-    """Return the current daily streak length given a list of walk dates"""
+def calc_streak(dates):
+    """Return the current daily streak length given a list of walk datetime stamps"""
     if not dates:
         return 0
-    dates_sorted = sorted(set([d.date() for d in dates]), reverse=True)
+    # De-duplicate and sort by date
+    dates_sorted = sorted({d.date() for d in dates}, reverse=True)
     streak = 0
-    day = datetime.now().date()
+    today = datetime.now().date()
     for d in dates_sorted:
-        if d == day - timedelta(days=streak):
+        if d == today - timedelta(days=streak):
             streak += 1
-        elif d < day - timedelta(days=streak):
+        elif d < today - timedelta(days=streak):
             break
     return streak
 
@@ -61,67 +59,89 @@ def tier_for_points(points: int) -> str:
             return name
     return "Bronze"
 
+def ensure_user(user_id: str, display_name: str = None):
+    u = st.session_state.users.setdefault(
+        user_id,
+        {"points": 0, "walk_dates": [], "team": None, "name": display_name or user_id},
+    )
+    # backfill keys in case of partial writes
+    u.setdefault("points", 0)
+    u.setdefault("walk_dates", [])
+    u.setdefault("team", None)
+    u.setdefault("name", display_name or user_id)
+    return u
+
 def award_points(user_id: str, minutes: int, is_group: bool, shared_photo: bool):
-    user = st.session_state.users.setdefault(user_id, {"points": 0, "walk_dates": [], "team": None, "name": user_id})
+    user = ensure_user(user_id, user_id)
     # Base points
-    gained = minutes * POINT_RULES["base_per_minute"]
+    gained = int(minutes) * POINT_RULES["base_per_minute"]
     # Group walk bonus
     if is_group:
         gained += POINT_RULES["group_walk_bonus"]
     # Photo share
     if shared_photo:
         gained += POINT_RULES["photo_share"]
-    # Streaks
+    # Streaks (include today)
     streak = calc_streak(user["walk_dates"] + [datetime.now()])
     if streak >= 30:
         gained += POINT_RULES["streak_30"]
     elif streak >= 7:
         gained += POINT_RULES["streak_7"]
     # Update
-    user["points"] += gained
+    user["points"] = int(user.get("points", 0)) + int(gained)
     user["walk_dates"].append(datetime.now())
     return gained, user["points"], streak
 
 def invite_friend(inviter_id: str, friend_email: str):
     st.session_state.invites.append({"inviter": inviter_id, "friend": friend_email, "ts": time.time()})
-    user = st.session_state.users.setdefault(inviter_id, {"points": 0, "walk_dates": [], "team": None, "name": inviter_id})
-    user["points"] += POINT_RULES["invite_bonus"]
+    user = ensure_user(inviter_id, inviter_id)
+    user["points"] = int(user.get("points", 0)) + POINT_RULES["invite_bonus"]
     return user["points"]
 
 def get_leaderboards():
-    users_df = pd.DataFrame([
-        {"user": u.get("name", uid), "points": u.get("points", 0), "team": (u.get("team") or "")}
-        for uid, u in st.session_state.users.items()
-    ])
+    """Return (users_df, teams_df) with guaranteed columns even if empty."""
+    users_raw = st.session_state.get("users", {})
+    user_rows = []
+    for uid, u in users_raw.items():
+        user_rows.append({
+            "user": (u.get("name") or uid),
+            "points": int(u.get("points", 0)),
+            "team": (u.get("team") or ""),
+        })
+    users_df = pd.DataFrame(user_rows, columns=["user", "points", "team"])
+    if not users_df.empty and "points" in users_df.columns:
+        users_df = users_df.sort_values("points", ascending=False).reset_index(drop=True)
+
     team_points = {}
-    for uid, u in st.session_state.users.items():
+    for uid, u in users_raw.items():
         t = u.get("team")
         if t:
-            team_points[t] = team_points.get(t, 0) + u.get("points", 0)
-    teams_df = pd.DataFrame([{"team": k, "points": v} for k, v in team_points.items()])
-    users_df = users_df.sort_values("points", ascending=False).reset_index(drop=True)
-    teams_df = teams_df.sort_values("points", ascending=False).reset_index(drop=True)
+            team_points[t] = int(team_points.get(t, 0)) + int(u.get("points", 0))
+    teams_df = pd.DataFrame([{"team": k, "points": v} for k, v in team_points.items()],
+                            columns=["team", "points"])
+    if not teams_df.empty and "points" in teams_df.columns:
+        teams_df = teams_df.sort_values("points", ascending=False).reset_index(drop=True)
     return users_df, teams_df
 
 # -----------------------
 # Sidebar: Profile & Team
 # -----------------------
 st.sidebar.title("👤 Profile")
-user_id = st.sidebar.text_input("Your username", value="martha")
-display_name = st.sidebar.text_input("Display name", value="Martha")
+user_id = st.sidebar.text_input("Your username", value="martha").strip() or "guest"
+display_name = st.sidebar.text_input("Display name", value="Martha").strip() or user_id
 if st.sidebar.button("Save Profile"):
-    st.session_state.users.setdefault(user_id, {"points": 0, "walk_dates": [], "team": None, "name": display_name})
-    st.session_state.users[user_id]["name"] = display_name
+    u = ensure_user(user_id, display_name)
+    u["name"] = display_name
     st.success("Profile saved!")
 
 st.sidebar.markdown("---")
 st.sidebar.title("👥 Team")
-team_name = st.sidebar.text_input("Create/Join team", value="Comeback Kids")
+team_name = st.sidebar.text_input("Create/Join team", value="Comeback Kids").strip()
 if st.sidebar.button("Join Team"):
-    u = st.session_state.users.setdefault(user_id, {"points": 0, "walk_dates": [], "team": None, "name": display_name})
+    u = ensure_user(user_id, display_name)
     u["team"] = team_name
-    st.session_state.teams.setdefault(team_name, {"captain": user_id, "members": set()})
-    st.session_state.teams[team_name]["members"].add(user_id)
+    team = st.session_state.teams.setdefault(team_name, {"captain": user_id, "members": set()})
+    team["members"].add(user_id)
     st.success(f"You joined team: {team_name}")
 
 st.sidebar.markdown("---")
@@ -134,7 +154,7 @@ with col2:
 st.sidebar.info("Reminders are simulated here; wire to FCM/APNs in production.")
 
 # -----------------------
-# Main Tabs
+# Main UI
 # -----------------------
 st.title("👟 Walking Buddies — Social Walking for Healthier Lifestyles")
 
@@ -149,9 +169,15 @@ with tab_home:
     st.metric("Total Teams", len(st.session_state.teams))
     users_df, teams_df = get_leaderboards()
     st.write("### Top Walkers")
-    st.dataframe(users_df.head(10), use_container_width=True)
+    if users_df.empty:
+        st.info("No walkers yet — log a walk to see the leaderboard!")
+    else:
+        st.dataframe(users_df.head(10), use_container_width=True)
     st.write("### Top Teams")
-    st.dataframe(teams_df.head(10), use_container_width=True)
+    if teams_df.empty:
+        st.info("No teams yet — join or create a team to get started!")
+    else:
+        st.dataframe(teams_df.head(10), use_container_width=True)
 
 with tab_log:
     st.subheader("Log a Walk")
@@ -172,9 +198,15 @@ with tab_leader:
     st.subheader("Leaderboards")
     users_df, teams_df = get_leaderboards()
     st.write("#### Individuals")
-    st.dataframe(users_df, use_container_width=True)
+    if users_df.empty:
+        st.info("No walkers yet — log a walk to see the leaderboard!")
+    else:
+        st.dataframe(users_df, use_container_width=True)
     st.write("#### Teams")
-    st.dataframe(teams_df, use_container_width=True)
+    if teams_df.empty:
+        st.info("No teams yet — join or create a team to get started!")
+    else:
+        st.dataframe(teams_df, use_container_width=True)
 
 with tab_challenges:
     st.subheader("Challenges")
@@ -186,9 +218,9 @@ with tab_challenges:
 
 with tab_rewards:
     st.subheader("Rewards & Tiers")
-    user = st.session_state.users.get(user_id, {"points": 0, "walk_dates": [], "team": None, "name": display_name})
-    current_tier = tier_for_points(user["points"])
-    st.metric("Your Points", user["points"])
+    user = ensure_user(user_id, display_name)
+    current_tier = tier_for_points(int(user.get("points", 0)))
+    st.metric("Your Points", int(user.get("points", 0)))
     st.metric("Your Tier", current_tier)
     st.write("**Rewards Examples**")
     st.write("- Digital Badges (milestones)")
